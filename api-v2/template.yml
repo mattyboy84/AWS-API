@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+ 
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  StageName:
+    Type: String
+    Default: Prod
+  stackName:
+    Type: String
+    Default: test-api-v2
+  queryFunctionStackName:
+    Type: String
+    Default: glue-bucket-crawler
+  AccessTokenValidity: #Cannot be more than the refresh token
+    Type: Number
+    Default: 1
+  IdTokenValidity: #Cannot be more than the refresh token
+    Type: Number
+    Default: 1
+  RefreshTokenValidity:
+    Type: Number
+    Default: 1
+  AccessTokenValidityUnits:
+    Type: String
+    Default: hours
+  IdTokenValidityUnits:
+    Type: String
+    Default: hours
+  RefreshTokenValidityUnits:
+    Type: String
+    Default: days
+  FileBucket:
+    Type: String
+    Default: incoming-files-asovd
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs14.x
+    MemorySize: 3008
+    Timeout: 900
+
+Resources:  
+  ApiIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+                - lambda.amazonaws.com
+                - cognito-idp.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${stackName}-ApiIntegrationRole"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "cognito-idp:InitiateAuth"
+                  - "cognito-idp:AdminSetUserPassword"
+                  - "cognito-idp:AdminCreateUser"
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - "iam:ListRolePolicies"
+                  - "iam:getRolePolicy"
+                Resource: "*"
+              - Effect: Allow
+                Action: "s3:putObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${stackName}-${FileBucket}"
+                  - !Sub "arn:aws:s3:::${stackName}-${FileBucket}/"
+                  - !Sub "arn:aws:s3:::${stackName}-${FileBucket}/*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  IncomingFileBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub "${stackName}-${FileBucket}"
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+########################
+
+  receiveOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${stackName}-receiveOrderFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/endpoints/order.handler
+      Environment:
+        Variables:
+          FILE_BUCKET_NAME: !Ref IncomingFileBucket
+
+  receiveOrderFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/lambda/
+          - !Select [6, !Split [':', !GetAtt receiveOrderFunction.Arn]]
+
+######
+  
+  authFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${stackName}-authFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/utils/Auth.authenticate
+      Environment:
+        Variables:
+          COGNITO_USERPOOL_APPCLIENT_ID: !Ref APICognitoUserPoolClient
+
+  authFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/lambda/
+          - !Select [6, !Split [':', !GetAtt authFunction.Arn]]
+
+######
+
+  createUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Join
+        - ''
+        - - !Sub "${stackName}-"
+          - create-user-
+          - !Ref APICognitoUserPool
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/utils/User.create
+      Environment:
+        Variables:
+          COGNITO_USERPOOL_APPCLIENT_ID: !Ref APICognitoUserPoolClient
+          COGNITO_USERPOOL_ID: !Ref APICognitoUserPool
+
+  createUserFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/lambda/
+          - !Select [6, !Split [':', !GetAtt createUserFunction.Arn]]
+  
+########################
+  
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      #StageName: !Ref StageName
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+      FailOnWarnings: true
+    #DependsOn:
+    #  - Stage
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      AutoDeploy: true
+      StageName: !Ref StageName
+      AccessLogSettings:
+        DestinationArn: !GetAtt apiProdAccessLogs.Arn
+        Format: "{\"requestId\":\"$context.requestId\",\"ip\":\"$context.identity.sourceIp\",\"requestTime\":\"$context.requestTime\",\"httpMethod\":\"$context.httpMethod\",\"routeKey\":\"$context.routeKey\",\"status\":\"$context.status\",\"protocol\":\"$context.protocol\",\"responseLength\":\"$context.responseLength\"}" 
+
+  apiProdAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/api-gatewayV2/
+          - !Sub "${stackName}-${StageName}-AccessLogs"
+  
+  Authorizer:
+    Type: 'AWS::ApiGatewayV2::Authorizer'
+    Properties:
+      Name: !Sub "${stackName}-LambdaAuthorizer"
+      ApiId: !Ref HttpApi
+      AuthorizerType: REQUEST
+      AuthorizerCredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      AuthorizerUri: !Join 
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt authFunction.Arn
+          - /invocations
+      AuthorizerPayloadFormatVersion: 2.0
+      AuthorizerResultTtlInSeconds: 0
+      EnableSimpleResponses: false
+
+################# POST ORDER endpoint
+  
+  OrderIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref HttpApi
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt receiveOrderFunction.Arn
+          - /invocations
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  OrderRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      OperationName: !Sub "${stackName}-OrderRoute"
+      ApiId: !Ref HttpApi
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      RouteKey: 'POST /Order'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref OrderIntegration
+
+################# GET FILE endpoint
+
+  GetFileIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref HttpApi
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - Fn::ImportValue:
+              !Sub '${queryFunctionStackName}-queryFunctionArn'
+         # - Fn::ImportValue: !Sub: '${queryFunctionStackName}-queryFunctionArn'
+          - /invocations
+      #IntegrationMethod: GET
+      PayloadFormatVersion: '2.0'
+
+  GetFileRouteQueryParams:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      OperationName: !Sub "${stackName}-GetFileRoute"
+      ApiId: !Ref HttpApi
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      RouteKey: 'GET /File'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref GetFileIntegration
+
+########################
+  
+  APICognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${stackName}-UserPool"
+      AutoVerifiedAttributes: 
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+      AliasAttributes:
+        - email
+        - preferred_username
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+
+  APICognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${stackName}-UserPoolClient"
+      UserPoolId: !Ref APICognitoUserPool
+      GenerateSecret: false
+      AccessTokenValidity: !Ref AccessTokenValidity
+      IdTokenValidity: !Ref IdTokenValidity
+      RefreshTokenValidity: !Ref RefreshTokenValidity
+      TokenValidityUnits:
+        AccessToken: !Ref AccessTokenValidityUnits
+        IdToken: !Ref IdTokenValidityUnits
+        RefreshToken: !Ref RefreshTokenValidityUnits
+      ExplicitAuthFlows:
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      ReadAttributes:
+        - email
+        - name
+      WriteAttributes:
+        - email
+        - name
+      ## OAuth support - hosted UI
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - http://localhost:8080/api/auth/callback/cognito
+      LogoutURLs:
+        - http://localhost:8080/api/auth/callback/cognito
+      AllowedOAuthScopes:
+        - aws.cognito.signin.user.admin
+        - email
+        - openid
+        - phone
+        - profile
+      AllowedOAuthFlows: 
+        - code
+        - implicit
+      AllowedOAuthFlowsUserPoolClient: True
+  
+  APICognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref APICognitoUserPool 
+      Domain: !Sub "${stackName}-domain"
+
+#########################################################################
+
+################### EXAMPLE GROUP FOR ORDER & File ENDPOINT 
+  APICognitoUserPoolGroupOrder:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: !Sub "${stackName}-UserPoolClient-OrderGroup"
+      UserPoolId: !Ref APICognitoUserPool
+      RoleArn: !GetAtt APIRoleOrders.Arn
+  APICognitoUserPoolGroupFile:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: !Sub "${stackName}-UserPoolClient-FileGroup"
+      UserPoolId: !Ref APICognitoUserPool
+      RoleArn: !GetAtt APIRoleFile.Arn
+  
+#################### EXAMPLE IAM ROLE FOR ORDER & File GROUP PERMS
+  APIRoleOrders:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${stackName}-POST-Order-Role"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action: "execute-api:Invoke"
+                Resource:
+                  - "arn:aws:execute-api:*:*:*/*/POST/Order"
+                  - "arn:aws:execute-api:*:*:*/*/POST/Order/"
+  APIRoleFile:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${stackName}-GET-File-Role"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action: "execute-api:Invoke"
+                Resource:
+                  - "arn:aws:execute-api:*:*:*/*/GET/File"
+                  - "arn:aws:execute-api:*:*:*/*/GET/File/*"
+
+#########################################################################
+
+Outputs: 
+  HttpApiUrl:
+    Description: URL of your API endpoint
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/'
+  HttpApiId:
+    Description: Api id of HttpApi
+    Value: !Ref HttpApi
+  UserPoolName: 
+    Value: !GetAtt APICognitoUserPool.ProviderName
+  UserPoolId:
+    Value: !Ref APICognitoUserPool
+  UserPoolUrl:
+    Value: !GetAtt APICognitoUserPool.ProviderURL
+  UserPoolAppClientId: 
+    Value: !Ref APICognitoUserPoolClient

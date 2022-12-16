@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: '2010-09-09'
+ 
+Transform: AWS::Serverless-2016-10-31
+ 
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  stackName:
+    Type: String
+    Default: Glue-crawler
+  AthenaBucket:
+    Type: String
+    Default: athena-bucket-agb43j
+  AthenaBucketQueryResults:
+    Type: String
+    Default: athena-bucket-agb43j-results
+  AthenaDatabase:
+    Type: String
+    Default: athena-database-agb43j
+  AthenaPageLimit:
+    Type: Number
+    Default: 5
+  AthenaMaxPageLimit:
+    Type: Number
+    Default: 10
+  QueueName:
+    Type: String
+    Default: test-crawler-SQS-Queue
+  CrawlerName:
+    Type: String
+    Default: athena-crawler-agb43j
+  QueryFunctionName:
+    Type: String
+    Default: athena-query-agb43j
+  CreateAthenaViewName:
+    Type: String
+    Default: athena-create-view-agb43j
+  AthenaStepFunctionName:
+    Type: String
+    Default: athena-stepFunction-agb43j
+
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs14.x
+    MemorySize: 3008
+    Timeout: 900
+    Environment:
+      Variables:
+        ATHENA_DATABASE: !Ref AthenaDatabase
+        #ATHENA_TABLE: !Ref AthenaTable
+        ATHENA_BUCKET: !Ref AthenaBucket
+        ATHENA_BUCKET_QUERY_RESULTS: !Ref AthenaBucketQueryResults
+        ATHENA_BUCKET_QUERY_RESULTS_FULL_PATH: !Sub "s3://${AthenaBucketQueryResults}/${stackName}"
+        ATHENA_GLUE_CRAWLER: !Ref CrawlerName
+        ATHENA_PAGE_LIMIT: !Ref AthenaPageLimit
+        ATHENA_MAX_PAGE_LIMIT: !Ref AthenaMaxPageLimit
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - glue.amazonaws.com
+                - states.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: "arn:aws:iam::968721831531:role/integrate"
+              - Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaBucket}/*"
+                  - !Sub "arn:aws:s3:::${AthenaBucketQueryResults}*"
+                  - !Sub "arn:aws:s3:::${AthenaBucketQueryResults}/*"
+              - Effect: Allow
+                Action: "glue:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "sqs:*"
+                Resource: !GetAtt MyQueue.Arn
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:aws:lambda:::function:${QueryFunctionName}"
+              - Effect: Allow
+                Action: "states:*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:GetQueryResults"
+                Resource: "arn:aws:athena:eu-west-2:*:workgroup/primary"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+
+######################################
+
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref QueryFunctionName
+      Handler: src/index.query
+      Role: !GetAtt LambdaExecutionRole.Arn
+    DependsOn:
+      - MyQueueSQSPolicy
+  
+  QueryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/lambda/
+          - !Select [6, !Split [':', !GetAtt QueryFunction.Arn]]
+
+######################################
+
+  MyQueue: 
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      VisibilityTimeout: 900
+
+  MyQueueSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !GetAtt MyQueue.QueueUrl
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - "SQS:SendMessage"
+              - "sqs:DeleteMessage"
+              - "sqs:GetQueueUrl"
+              - "sqs:ListDeadLetterSourceQueues"
+              - "sqs:DeleteMessageBatch"
+              - "sqs:ReceiveMessage"
+              - "sqs:GetQueueAttributes"
+              - "sqs:ListQueueTags"
+              - "sqs:SetQueueAttributes"
+              - "sqs:PurgeQueue"
+            Effect: Allow
+            Principal:
+              Service: "s3.amazonaws.com"
+            Resource: !GetAtt MyQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::${AthenaBucket}
+    DependsOn:
+      - MyQueue
+
+  S3GlueBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref AthenaBucket
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+    DeletionPolicy: Delete
+    DependsOn:
+      - MyQueueSQSPolicy
+
+  S3GlueBucketEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: !Sub "${stackName}-${AthenaBucket}-eventRule"
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+      State: ENABLED
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+          - "Object Deleted"
+        detail:
+          bucket:
+            name:
+            -  !Ref S3GlueBucket
+          object:
+            size:
+              - exists: false
+              - anything-but: 0
+      Targets:
+        - Arn: !GetAtt testStepFunction.Arn
+          Id: !Sub "${stackName}-eventRule-Id-tmnx8"
+          RoleArn: !GetAtt LambdaExecutionRole.Arn
+    DependsOn:
+      - S3GlueBucket
+
+  S3GlueBucketResults:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref AthenaBucketQueryResults
+    DeletionPolicy: Delete
+ 
+  glueDatabase:
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+        Name: !Ref AthenaDatabase
+        LocationUri: !Ref S3GlueBucket 
+  
+  MyCrawler1:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref CrawlerName
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DatabaseName: !Ref glueDatabase  
+      #Classifiers:
+      #  - !Ref MyClassifier
+      Targets:
+        S3Targets:
+          - EventQueueArn: !GetAtt MyQueue.Arn
+            Path: !Sub "s3://${AthenaBucket}/"
+      RecrawlPolicy:
+        RecrawlBehavior: "CRAWL_EVERYTHING"
+        #RecrawlBehavior: "CRAWL_EVENT_MODE"
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "DELETE_FROM_DATABASE"
+      Configuration: "{\"Version\":1,\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\",\"TableLevelConfiguration\":2}}"
+    DependsOn:
+      - MyQueueSQSPolicy
+ 
+  testStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+      StateMachineName: !Ref AthenaStepFunctionName
+      StateMachineType: "STANDARD"
+      TracingConfiguration:
+        Enabled: true
+      Definition:
+        StartAt: "SendSQS"
+        States:
+          SendSQS:
+            Type: Task #turn to pass?
+            Resource: "arn:aws:states:::sqs:sendMessage"
+            Parameters:
+              QueueUrl: !GetAtt MyQueue.QueueUrl
+              MessageBody.$: "$"
+            Next: GetCrawlerStatus
+          GetCrawlerStatus:
+            Type: Task
+            Parameters:
+              Name: !Ref MyCrawler1
+            Resource: "arn:aws:states:::aws-sdk:glue:getCrawler"
+            Next: CheckCrawlerStatus
+          CheckCrawlerStatus:
+            Type: Choice
+            Choices:
+              - Variable: "$.Crawler.State"
+                StringEquals: "READY"
+                Next: StartCrawler
+              - Variable: "$.Crawler.State"
+                StringEquals: "STOPPING"
+                Next: Wait
+              - Variable: "$.Crawler.State"
+                StringEquals: "RUNNING"
+                Next: End
+          Wait:
+            Type: Wait
+            Seconds: 30
+            Next: GetCrawlerStatus
+          End:
+            Type: Wait
+            Seconds: 0
+            End: true
+          StartCrawler:
+            Type: Task
+            Resource: "arn:aws:states:::aws-sdk:glue:startCrawler"
+            Parameters:
+              Name: !Ref MyCrawler1
+            End: true
+
+Outputs:
+  queryFunctionArn:
+    Value: !GetAtt QueryFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-queryFunctionArn'

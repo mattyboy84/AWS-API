@@ -1,0 +1,20 @@
+{
+  "name": "api-v2",
+  "version": "1.0.0",
+  "description": "hello",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "aws-sdk": "^2.1176.0",
+    "crypto-js": "^4.1.1",
+    "node-fetch": "^2.6.7",
+    "postman-collection": "^4.1.5"
+  },
+  "devDependencies": {
+    "eslint": "^8.27.0"
+  }
+}
