@@ -83,9 +83,6 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: sts:AssumeRole
-                Resource: "arn:aws:iam::968721831531:role/integrate"
-              - Effect: Allow
                 Action: "s3:*"
                 Resource:
                   - !Sub "arn:aws:s3:::${AthenaBucket}"
